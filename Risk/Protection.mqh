@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //| Risk/Protection.mqh                                              |
-//| Circuit Breakers: Daily/Weekly Loss, Consecutive Loss, Spread     |
-//| MODIFIED: Completed UpdateState with live statistics tracking   |
+//| Enhanced Circuit Breakers with Dynamic Risk Adjustment           |
+//| Reduces position size after consecutive losses                   |
 //+------------------------------------------------------------------+
 #ifndef __PROTECTION_MQH__
 #define __PROTECTION_MQH__
@@ -25,6 +25,7 @@ private:
    double m_lastEquity;
    int m_consecLossCounter;
    datetime m_lastTradeTime;
+   double m_currentRiskMultiplier;  // Dynamic risk reduction
 
 public:
    bool Init(double dailyLoss, double weeklyLoss, int consecLoss, int maxPos, double maxRisk)
@@ -39,6 +40,7 @@ public:
       m_lastEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       m_consecLossCounter = 0;
       m_lastTradeTime = 0;
+      m_currentRiskMultiplier = 1.0;
       Print("[Protection] Circuit breakers active. Daily:", dailyLoss, "% Weekly:", weeklyLoss, "% Consec:", consecLoss);
       return true;
    }
@@ -96,6 +98,12 @@ public:
       return (spreadPrice <= profile.maxSpreadPoints);
    }
 
+   // Get dynamic risk multiplier based on recent performance
+   double GetRiskMultiplier() const
+   {
+      return m_currentRiskMultiplier;
+   }
+
    void UpdateState(EAState &state)
    {
       double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -111,7 +119,14 @@ public:
                m_consecLossCounter++;
                state.consecutiveLosses = m_consecLossCounter;
                m_lastTradeTime = TimeCurrent();
-               g_logger.LogEvent("PROTECTION", StringFormat("Loss detected. Consecutive: %d/%d", m_consecLossCounter, m_maxConsecLosses));
+
+               // Dynamic risk reduction after consecutive losses
+               if(m_consecLossCounter == 1) m_currentRiskMultiplier = 0.75;
+               else if(m_consecLossCounter == 2) m_currentRiskMultiplier = 0.50;
+               else if(m_consecLossCounter >= 3) m_currentRiskMultiplier = 0.25;
+
+               g_logger.LogEvent("PROTECTION", StringFormat("Loss detected. Consecutive: %d/%d. Risk multiplier: %.2f", 
+                   m_consecLossCounter, m_maxConsecLosses, m_currentRiskMultiplier));
             }
          }
          else if(equityChange > 0)
@@ -120,15 +135,16 @@ public:
             {
                m_consecLossCounter = 0;
                state.consecutiveLosses = 0;
-               g_logger.LogEvent("PROTECTION", "Profit detected. Consecutive loss counter reset.");
+               m_currentRiskMultiplier = 1.0; // Reset to full risk
+               g_logger.LogEvent("PROTECTION", "Profit detected. Risk multiplier reset to 1.0");
             }
          }
       }
       m_lastEquity = currentEquity;
       if(InpDebugMode)
       {
-         g_logger.LogEvent("PROTECTION", StringFormat("State | Daily: %.2f | Weekly: %.2f | Consec: %d | Equity: %.2f",
-             state.dailyPnL, state.weeklyPnL, state.consecutiveLosses, currentEquity));
+         g_logger.LogEvent("PROTECTION", StringFormat("State | Daily: %.2f | Weekly: %.2f | Consec: %d | RiskMult: %.2f | Equity: %.2f",
+             state.dailyPnL, state.weeklyPnL, state.consecutiveLosses, m_currentRiskMultiplier, currentEquity));
       }
    }
 
@@ -143,10 +159,11 @@ public:
          state.totalTradesToday = 0;
          state.consecutiveLosses = 0;
          m_consecLossCounter = 0;
+         m_currentRiskMultiplier = 1.0;
          m_lastDailyReset = todayStart;
          state.equityAtStart = AccountInfoDouble(ACCOUNT_EQUITY);
          m_lastEquity = state.equityAtStart;
-         g_logger.LogEvent("PROTECTION", "Daily counters reset");
+         g_logger.LogEvent("PROTECTION", "Daily counters reset. Risk multiplier reset to 1.0");
       }
       if(dt.day_of_week == 1 && todayStart > m_lastWeeklyReset)
       {

@@ -1,20 +1,18 @@
 //+------------------------------------------------------------------+
 //| Universal_MTF_EA.mq5                                             |
-//| Universal Multi-Timeframe Expert Advisor v2.0                    |
+//| Universal Multi-Timeframe Expert Advisor v2.1                    |
+//| Enhanced: Fibonacci + Liquidity + Dynamic Risk + Confluence        |
 //+------------------------------------------------------------------+
 #property strict
 #property copyright "Institutional Quantitative Systems"
-#property version   "2.000"
-#property description "Universal MTF EA v2.0"
+#property version   "2.100"
+#property description "Universal MTF EA v2.1 - Fibonacci + Liquidity + Smart Risk"
 
-//--- Input for magic number
+//--- Input for magic number (ONLY in .mq5, not in any .mqh)
 input group "=== EA IDENTIFICATION ==="
 input ulong InpMagicNumber = 20250625;
 input string InpEALabel = "Universal_MTF";
 
-//+------------------------------------------------------------------+
-//| MODULE INCLUDES                                                  |
-//+------------------------------------------------------------------+
 input group "=== RISK MANAGEMENT ==="
 input double InpMaxRiskPerTrade = 0.5;
 input double InpMaxDailyLoss = 2.0;
@@ -63,6 +61,9 @@ input string InpLogPath = "Universal_MTF_EA/";
 input bool InpDebugMode = false;
 input int InpDashboardUpdateSec = 5;
 
+//+------------------------------------------------------------------+
+//| MODULE INCLUDES                                                  |
+//+------------------------------------------------------------------+
 #include "Core/Config.mqh"
 #include "Core/State.mqh"
 #include "Core/Logger.mqh"
@@ -71,6 +72,8 @@ input int InpDashboardUpdateSec = 5;
 #include "Data/PriceEngine.mqh"
 #include "Data/VWAP_Engine.mqh"
 #include "Data/Volatility.mqh"
+#include "Data/FibonacciEngine.mqh"
+#include "Data/LiquidityEngine.mqh"
 #include "Execution/OrderManager.mqh"
 #include "Execution/TradeManager.mqh"
 #include "Logic/MacroAudit.mqh"
@@ -91,6 +94,8 @@ CTelegramNotifier g_notifier;
 CPriceEngine g_priceEngine;
 CVWAPEngine g_vwapEngine;
 CVolatility g_volatility;
+CFibonacciEngine g_fibonacci;
+CLiquidityEngine g_liquidity;
 CMacroAudit g_macroAudit;
 CContextFilter g_contextFilter;
 CMicroTrigger g_microTrigger;
@@ -108,7 +113,7 @@ CTradeManager g_tradeManager;
 int OnInit()
 {
    Print("============================================================");
-   Print("[Universal_MTF_EA] Initializing v2.000...");
+   Print("[Universal_MTF_EA] Initializing v2.100...");
    Print("============================================================");
 
    if(!g_logger.Init(InpLogPath, InpEALabel, InpMagicNumber))
@@ -116,7 +121,7 @@ int OnInit()
       Print("[CRITICAL] Logger init failed. EA halted.");
       return INIT_FAILED;
    }
-   g_logger.LogEvent("SYSTEM", "EA Initialization started v2.0");
+   g_logger.LogEvent("SYSTEM", "EA Initialization started v2.1 (Fib + Liquidity + Smart Risk)");
 
    if(!g_session.Init())
    {
@@ -146,6 +151,18 @@ int OnInit()
    if(!g_volatility.Init(InpATRPeriod, InpATRBaseline, InpHTF, InpMTF))
    {
       g_logger.LogError("OnInit", 0, "Volatility init failed", 0);
+      return INIT_FAILED;
+   }
+
+   if(!g_fibonacci.Init(InpMTF))
+   {
+      g_logger.LogError("OnInit", 0, "FibonacciEngine init failed", 0);
+      return INIT_FAILED;
+   }
+
+   if(!g_liquidity.Init(InpLTF))
+   {
+      g_logger.LogError("OnInit", 0, "LiquidityEngine init failed", 0);
       return INIT_FAILED;
    }
 
@@ -231,17 +248,19 @@ int OnInit()
    g_priceEngine.RefreshAll();
    g_vwapEngine.Calculate(g_state.vwapState);
    g_volatility.Update();
+   g_fibonacci.Calculate();
+   g_liquidity.Update();
    g_macroAudit.Analyze(g_state);
    g_contextFilter.Analyze(g_state);
 
-   g_logger.LogEvent("SYSTEM", "EA Initialization completed successfully v2.0");
+   g_logger.LogEvent("SYSTEM", "EA Initialization completed successfully v2.1");
    g_logger.LogEvent("SYSTEM", StringFormat("Symbol: %s | Class: %s | HTF: %s | MTF: %s | LTF: %s",
                      _Symbol, g_state.assetProfile.description, EnumToString(InpHTF),
                      EnumToString(InpMTF), EnumToString(InpLTF)));
 
    if(InpAlertOnTrade)
    {
-      g_notifier.SendMessage("*Universal MTF EA v2.0 Started*\n\nSymbol: " + _Symbol + 
+      g_notifier.SendMessage("*Universal MTF EA v2.1 Started*\n\nSymbol: " + _Symbol + 
                              "\nAsset: " + g_state.assetProfile.description +
                              "\nTime: " + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
    }
@@ -269,7 +288,7 @@ void OnDeinit(const int reason)
 
    if(InpAlertOnTrade)
    {
-      g_notifier.SendMessage("*Universal MTF EA v2.0 Stopped*\n\nSymbol: " + _Symbol +
+      g_notifier.SendMessage("*Universal MTF EA v2.1 Stopped*\n\nSymbol: " + _Symbol +
                              "\nReason: " + IntegerToString(reason) +
                              "\nDaily PnL: " + StringFormat("%.2f", g_state.dailyPnL) +
                              "\nTime: " + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
@@ -353,6 +372,8 @@ void OnTimer()
          g_state.isBarClosedMTF = true;
          g_state.lastMTFBarTime = iTime(_Symbol, InpMTF, 0);
          g_volatility.Update();
+         g_fibonacci.Calculate();
+         g_liquidity.Update();
          g_contextFilter.Analyze(g_state);
          g_regimeEngine.UpdateState(g_state);
       }
@@ -420,8 +441,8 @@ void ProcessSignal(const SignalData &signal)
    {
       g_state.openPositions++;
       g_logger.LogTradeOpen(signal, tradeParams, ticket);
-      g_logger.LogEvent("EXECUTE", StringFormat("Order Ticket=%llu | %s | Lots: %.2f",
-                          ticket, signal.isBuy ? "BUY" : "SELL", tradeParams.lotSize));
+      g_logger.LogEvent("EXECUTE", StringFormat("Order Ticket=%llu | %s | Lots: %.2f | RiskMult: %.2f",
+                          ticket, signal.isBuy ? "BUY" : "SELL", tradeParams.lotSize, g_protection.GetRiskMultiplier()));
       if(InpAlertOnTrade) g_notifier.SendTradeOpen(signal, tradeParams, ticket);
    }
    else
